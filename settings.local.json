@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"/c/Users/20800/.vscode/extensions/anthropic.claude-code-2.1.145-win32-x64/resources/native-binary/claude.exe\" -c -p \"回复：测试连接，只需要回复 ok 两个字\" --output-format stream-json)"
+    ]
+  }
+}

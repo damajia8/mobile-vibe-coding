@@ -1,0 +1,46 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Mobile-Vibe-Monitor · 随开随关",
+            "detail": "当 VS Code 打开此文件夹时静默拉起监控服务；关窗时 VS Code 自动杀掉该后台任务",
+            "type": "shell",
+            "command": "if not exist .vibe_env\\Scripts\\python.exe (python -m venv .vibe_env && .vibe_env\\Scripts\\python.exe -m pip install --quiet --upgrade pip && .vibe_env\\Scripts\\python.exe -m pip install --quiet fastapi \"uvicorn[standard]\" watchdog psutil) & .vibe_env\\Scripts\\python.exe vibe_server.py",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "runOptions": {
+                "runOn": "folderOpen"
+            },
+            "presentation": {
+                "echo": false,
+                "reveal": "never",
+                "focus": false,
+                "panel": "dedicated",
+                "showReuseMessage": false,
+                "clear": true,
+                "close": false
+            },
+            "isBackground": true,
+            "problemMatcher": []
+        },
+        {
+            "label": "终止 Mobile-Vibe-Monitor (释放 8000 端口)",
+            "detail": "强制杀掉占用 8000 端口的进程，用于手动关停服务",
+            "type": "shell",
+            "command": "for /f \"tokens=5\" %a in ('netstat -ano ^| findstr :8000 ^| findstr LISTENING') do @taskkill /F /PID %a 2>nul & echo [✓] Mobile-Vibe-Monitor 已停止",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "presentation": {
+                "echo": true,
+                "reveal": "silent",
+                "focus": false,
+                "panel": "shared",
+                "showReuseMessage": false,
+                "clear": false
+            },
+            "problemMatcher": []
+        }
+    ]
+}
