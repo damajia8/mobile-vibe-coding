@@ -221,6 +221,9 @@ Write-Output ($titles -join "`n")
 # 全局状态机
 # =============================================================================
 
+from collections import deque
+
+
 class AppState:
 
     def __init__(self) -> None:
@@ -230,8 +233,20 @@ class AppState:
         self.thinking: str = ""
         self.pending_prompt: str = ""
         self.logs: list[str] = []
+        self.context_history: deque = deque(maxlen=50)
+        self.option_mode: int = 3
+
+    def push_context(self, tag: str, text: str) -> None:
+        """原子化压入上下文节点"""
+        node = {
+            "ts": time.strftime("%H:%M:%S"),
+            "tag": tag,
+            "text": text,
+        }
+        self.context_history.append(node)
 
     def to_dict(self) -> dict[str, Any]:
+        # 原子化浅拷贝，防止协程并发迭代时 RuntimeError
         return {
             "status": self.status,
             "current_file": self.current_file,
@@ -239,6 +254,8 @@ class AppState:
             "thinking": self.thinking,
             "pending_prompt": self.pending_prompt,
             "logs": self.logs[-30:],
+            "context_history": list(self.context_history),
+            "option_mode": self.option_mode,
         }
 
 
@@ -381,10 +398,14 @@ async def handle_action(ws: WebSocket, action: str, payload: dict[str, Any]) -> 
             return
 
         # 后台线程执行 SendKeys 发送数字键
+        key_label = {"1": "Yes", "2": "Allow", "3": "No"}.get(key, key)
         loop = asyncio.get_running_loop()
         ok, msg = await loop.run_in_executor(None, _send_key_to_claude, key)
         if ok:
+            state.push_context("success", f"⌨️ 已选择 [{key_label}]")
+            state.push_context("system", "🟢 决策已成功执行，终端锁已释放，等待 AI 插件进入下一轮微循环。")
             await broadcast_log(f"⌨️ 已发送按键 [{key}] → {msg}")
+            await broadcast_state()
         else:
             await broadcast_log(f"❌ 按键发送失败 [{key}]: {msg}")
         await manager.send_to(ws, {
@@ -457,13 +478,33 @@ async def handle_action(ws: WebSocket, action: str, payload: dict[str, Any]) -> 
         # 后台线程执行剪贴板粘贴 + SendKeys
         loop = asyncio.get_running_loop()
         ok, msg = await loop.run_in_executor(None, _deliver_prompt_to_claude, prompt_text)
+
         if ok:
-            state.thinking = f"✅ {msg}"
-            await broadcast_log(f"📤 {msg}")
+            state.push_context("user", prompt_text)
+            await broadcast_log(f"📤 已送达终端，正在等待 AI 插件产生代码响应...")
+
+            # 🛡️ 极客方案：等电脑端弹稳了再发。进行最大 3 秒的快速主动状态对齐轮询
+            for _ in range(30):  # 30 * 0.1秒 = 3秒最大容忍等待
+                await asyncio.sleep(0.1)  # 释放事件循环，允许后台 monitor_workspace_changes 协程并发抢占
+
+                # 如果发现后台轮询协程已经先一步成功触发了 WAITING_CONFIRM 拦截闸门
+                if state.status == "WAITING_CONFIRM":
+                    # 电脑端已经弹稳了！立刻交出全部的广播主控权，强行熔断自杀，绝对不允许发送后续的 IDLE 覆盖包
+                    return
+
         else:
-            state.thinking = f"❌ {msg}"
-            await broadcast_log(f"❌ {msg}")
-        state.status = "IDLE"
+            await broadcast_log(f"❌ SendKeys 失败: {msg}")
+
+        # 如果顺利跑完 3 秒 AI 都只是在纯思考、纯查文件（未触发出写文件拦截），才允许进入正常的清理状态
+        if state.status != "WAITING_CONFIRM":
+            state.status = "IDLE"
+            state.thinking = ""
+            state.push_context("system", "✅ agent分析中，请等待后执行决策")
+            await manager.broadcast({
+                "type": "execution_complete",
+                "message": "agent分析中，请等待后执行决策",
+                "timestamp": time.time(),
+            })
         state.pending_prompt = ""
         await broadcast_state()
 
@@ -600,6 +641,7 @@ async def handle_action(ws: WebSocket, action: str, payload: dict[str, Any]) -> 
             "active_connections": manager.active_count,
             "active_agent": ACTIVE_AGENT,
             "timestamp": time.time(),
+            "data": state.to_dict(),
         })
 
     else:
@@ -905,6 +947,20 @@ async def monitor_agent_processes(interval: float = 2.5) -> None:
 # 后台协程 ② — Git Diff 变更轮询
 # =============================================================================
 
+def _extract_diff_snippet(diff_text: str, max_lines: int = 5) -> str:
+    """从 unified diff 中提取实际代码变更行（+ / - 开头的前 N 行）"""
+    lines: list[str] = []
+    for line in diff_text.split('\n'):
+        if len(line) < 1:
+            continue
+        prefix = line[0]
+        if prefix in ('+', '-') and not line.startswith(('+++', '---')):
+            lines.append(line)
+            if len(lines) >= max_lines:
+                break
+    return '\n'.join(lines) if lines else ''
+
+
 _last_diff_hash: str = ""
 
 async def monitor_workspace_changes(interval: float = 3.0) -> None:
@@ -934,13 +990,22 @@ async def monitor_workspace_changes(interval: float = 3.0) -> None:
                     if ACTIVE_AGENT != "OFFLINE" and state.status in ("IDLE", "RUNNING"):
                         state.status = "WAITING_CONFIRM"
                         state.thinking = f"🔍 {ACTIVE_AGENT} 产生 {len(changed_files)} 个文件变更，等待审批…"
+                        diff_snippet = _extract_diff_snippet(diff)
+                        if diff_snippet:
+                            state.push_context("ai", f"正在尝试写入代码变更:\n{diff_snippet}")
+                        else:
+                            state.push_context("ai", f"变更 {len(changed_files)} 个文件: {', '.join(changed_files[:5])}{'…' if len(changed_files) > 5 else ''}")
+                        state.push_context("ai", f"❓ 询问：我已针对 [{state.current_file}] 拟定好优化方案，是否允许我将上述变更写入到该文件中？")
+                        # 智能分析选项数：特殊文件（如 123.txt）强制 2 选项审查，常规修改为 3 选项
+                        if "123.txt" in (state.current_file or "") or any("123.txt" in f for f in changed_files):
+                            state.option_mode = 2
+                        else:
+                            state.option_mode = 3
+                        # 强制前置同步：原子化广播完整 state_sync，确保手机端瞬间收到提问+选项
                         await manager.broadcast({
-                            "type": "workspace_change",
-                            "workspace_name": CURRENT_WORKSPACE,
-                            "diff": diff,
-                            "changed_files": changed_files,
+                            "type": "state_sync",
+                            "data": state.to_dict(),
                             "active_agent": ACTIVE_AGENT,
-                            "timestamp": time.time(),
                         })
                         await broadcast_state()
                     elif ACTIVE_AGENT == "OFFLINE":
@@ -955,7 +1020,13 @@ async def monitor_workspace_changes(interval: float = 3.0) -> None:
                     state.diff_text = ""
                     state.current_file = ""
                     state.thinking = ""
+                    state.push_context("system", "✅ 操作已经成功确认，请等待后执行决策")
                     await broadcast_state()
+                    await manager.broadcast({
+                        "type": "execution_complete",
+                        "message": "agent分析中，请等待后执行决策",
+                        "timestamp": time.time(),
+                    })
         except Exception:
             pass
 
